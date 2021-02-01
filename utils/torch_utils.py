@@ -60,6 +60,7 @@ def is_parallel(model):
     return type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
 
 
+#找出在da中与db键相同，键值形状相同的键值对，排除exclude
 def intersect_dicts(da, db, exclude=()):
     # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
     return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}

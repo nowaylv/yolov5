@@ -76,6 +76,7 @@ def check_git_status():
 
 def check_img_size(img_size, s=32):
     # Verify img_size is a multiple of stride s
+    #img_size有可能小于设定的
     new_size = make_divisible(img_size, int(s))  # ceil gs-multiple
     if new_size != img_size:
         print('WARNING: --img-size %g must be multiple of max stride %g, updating to %g' % (img_size, s, new_size))
@@ -86,8 +87,10 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     # Check anchor fit to data, recompute if necessary
     print('\nAnalyzing anchors... ', end='')
     m = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]  # Detect()
+    #扩张到一条边是640的形状
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
+    #随机缩放,降标签算出来
     wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
 
     def metric(k):  # compute metric
@@ -102,6 +105,7 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     print('anchors/target = %.2f, Best Possible Recall (BPR) = %.4f' % (aat, bpr), end='')
     if bpr < 0.98:  # threshold to recompute
         print('. Attempting to generate improved anchors, please wait...' % bpr)
+        # numel = numbur of element
         na = m.anchor_grid.numel() // 2  # number of anchors
         new_anchors = kmean_anchors(dataset, n=na, img_size=imgsz, thr=thr, gen=1000, verbose=False)
         new_bpr = metric(new_anchors.reshape(-1, 2))[0]
@@ -160,9 +164,10 @@ def check_dataset(dict):
 
 def make_divisible(x, divisor):
     # Returns x evenly divisible by divisor
+    #math.ceil 向上取整
     return math.ceil(x / divisor) * divisor
 
-
+#统计每个类别的比例
 def labels_to_class_weights(labels, nc=80):
     # Get class weights (inverse frequency) from training labels
     if labels[0] is None:  # no labels loaded
@@ -170,6 +175,7 @@ def labels_to_class_weights(labels, nc=80):
 
     labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
     classes = labels[:, 0].astype(np.int)  # labels = [class xywh]
+    #统计每个类别非零类别的个数
     weights = np.bincount(classes, minlength=nc)  # occurrences per class
 
     # Prepend gridpoint count (for uCE training)
@@ -185,7 +191,9 @@ def labels_to_class_weights(labels, nc=80):
 def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
     # Produces image weights based on class mAPs
     n = len(labels)
+    #shape = n,80
     class_counts = np.array([np.bincount(labels[i][:, 0].astype(np.int), minlength=nc) for i in range(n)])
+    #所有框的类别比例乘以当前图片中的类别比例
     image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
     # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
     return image_weights
@@ -346,7 +354,6 @@ def compute_ap(recall, precision):
 
     return ap, mpre, mrec
 
-
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-9):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
     box2 = box2.T
@@ -477,6 +484,7 @@ class BCEBlurWithLogitsLoss(nn.Module):
         return loss.mean()
 
 
+#targets 中的shape是xyxy format
 def compute_loss(p, targets, model):  # predictions, targets, model
     device = targets.device
     lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
@@ -491,7 +499,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     cp, cn = smooth_BCE(eps=0.0)
 
     # Focal loss
-    g = h['fl_gamma']  # focal loss gamma
+    g = h['fl_gamma']  # focal loss gamma default to 0
     if g > 0:
         BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
@@ -542,11 +550,19 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
 def build_targets(p, targets, model):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+    #targets --- (当前批次图片索引，类别, x,y,w,h)
     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    #na是每个尺度的anchor数量，一般为3
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
+    #种类标签，box标签，栅格定位标签，anchor
     tcls, tbox, indices, anch = [], [], [], []
     gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+    #形状是na,nt / 3,nt
+    #ai---anchor index
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+    #cat na,1,shape(target)  na,nt,1
+    #target后面加个anchor索引（同一尺度内），target三个anchor,...
+    #形状变为(当前批次图片索引，类别, x,y,w,h， 一个尺度下的anchor索引)
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
     g = 0.5  # bias
@@ -555,25 +571,37 @@ def build_targets(p, targets, model):
                         # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                         ], device=targets.device).float() * g  # offsets
 
+    #nl--多少种尺度，number of layers
     for i in range(det.nl):
         anchors = det.anchors[i]
+        #(w, h, w, h)
         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
 
         # Match targets to anchors
-        t = targets * gain
+        #target第一个是图片索引，xywh的归一化坐标
+        #将归一化坐标转化为特征图上的对应坐标
+        t = targets * gain#shape = (na,nt,7) 7---（img_index, cls, x,y, w, h, anchor_index）
+        
         if nt:
             # Matches
+            #计算宽宽比高高比
             r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+            #anchor_t default to  4.0
+            #取最大的
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
             # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
+            #t[false]是个空的
             t = t[j]  # filter
-
             # Offsets
             gxy = t[:, 2:4]  # grid xy
+            print(gxy.shape)
+            #w, h(number of grid)
             gxi = gain[[2, 3]] - gxy  # inverse
             j, k = ((gxy % 1. < g) & (gxy > 1.)).T
             l, m = ((gxi % 1. < g) & (gxi > 1.)).T
             j = torch.stack((torch.ones_like(j), j, k, l, m))
+            # print('shaoe: ', j.shape)
+            
             t = t.repeat((5, 1, 1))[j]
             offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
         else:

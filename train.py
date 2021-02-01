@@ -31,6 +31,8 @@ from utils.general import (
 from utils.google_utils import attempt_download
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts
 
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] ='True'
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +61,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         data_dict = yaml.load(f, Loader=yaml.FullLoader)  # data dict
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
+    #从配置的文件中去读取训练集测试集目录
     train_path = data_dict['train']
     test_path = data_dict['val']
     nc, names = (1, ['item']) if opt.single_cls else (int(data_dict['nc']), data_dict['names'])  # number classes, names
@@ -70,11 +73,13 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        if hyp.get('anchors'):
+        if hyp.get('anchors'):#默认anchor被注释掉的所以此处是false
             ckpt['model'].yaml['anchors'] = round(hyp['anchors'])  # force autoanchor
+        # opt.cfg优先
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc).to(device)  # create
         exclude = ['anchor'] if opt.cfg or hyp.get('anchors') else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
+        # 找出state_dict中与模型的参数中有相同键值对能复制的键值对，当然排除每个格子输出anchor数
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
@@ -152,7 +157,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
     # Image sizes
     gs = int(max(model.stride))  # grid size (max stride)
-    imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
+    # check_img_size返回向下取整（32）的大小
+    imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples-----img_size?
 
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
@@ -197,13 +203,17 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
             # Anchors
             if not opt.noautoanchor:
+                #对图片尺寸做一个随机扰动（0.9， 1.1），然后再计算anchor的最优召回
+                # 如果最优召回小于0.98就再生成一次anchor
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
 
     # Model parameters
+    #类别少一点权重会削弱
     hyp['cls'] *= nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
+    #统计类别权重，基于所有框
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
     model.names = names
 
@@ -214,7 +224,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(enabled=cuda)
+    scaler = amp.GradScaler(enabled=cuda)#pytorch1.6更新amp
     logger.info('Image sizes %g train, %g test\n'
                 'Using %g dataloader workers\nLogging results to %s\n'
                 'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, save_dir, epochs))
@@ -222,11 +232,15 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         model.train()
 
         # Update image weights (optional)
-        if opt.image_weights:
+        if opt.image_weights:#默认没有
             # Generate indices
             if rank in [-1, 0]:
+                #根据测试出来的map动态调整类别比重,2次方
                 cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2  # class weights
+                #所有框的类别比例乘以当前图片中的类别比例
                 iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+                #range(dataset.n)取值范围， weights每一类取值比重， k取多少个
+                #后面没用
                 dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
             # Broadcast if DDP
             if rank != -1:
@@ -250,7 +264,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
-
+            print('targets: ', targets[:, 0])
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -291,10 +305,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # Print
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                #还剩多少内存
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-                pbar.set_description(s)
+                pbar.set_description(s)#----------
 
                 # Plot
                 if ni < 3:
@@ -422,6 +437,7 @@ if __name__ == '__main__':
     # Set DDP variables
     opt.total_batch_size = opt.batch_size
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
+    #os.environ['RANK']系统进程数
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
     if opt.global_rank in [-1, 0]:
@@ -441,6 +457,7 @@ if __name__ == '__main__':
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
+
         opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
 
     # DDP mode
@@ -526,6 +543,7 @@ if __name__ == '__main__':
                 x = np.loadtxt('evolve.txt', ndmin=2)
                 n = min(5, len(x))  # number of previous results to consider
                 x = x[np.argsort(-fitness(x))][:n]  # top n mutations
+                #fitness对P,R,map0.5, ,map....加权
                 w = fitness(x) - fitness(x).min()  # weights
                 if parent == 'single' or len(x) == 1:
                     # x = x[random.randint(0, n - 1)]  # random selection

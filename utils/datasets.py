@@ -47,7 +47,6 @@ def exif_size(img):
 
     return s
 
-
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache.
@@ -334,14 +333,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
-        self.rect = False if image_weights else rect
+        self.rect = False if image_weights else rect#默认False
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.mosaic_border = [-img_size // 2, -img_size // 2] 
         self.stride = stride
 
         def img2label_paths(img_paths):
             # Define label paths as a function of image paths
             sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+            #返回每个图片的标签地址
             return [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in img_paths]
 
         try:
@@ -364,6 +364,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
         # Check cache
+        #cache主要存放标签
         self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = str(Path(self.label_files[0]).parent) + '.cache'  # cached labels
         if os.path.isfile(cache_path):
@@ -376,6 +377,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Read cache
         cache.pop('hash')  # remove hash
         labels, shapes = zip(*cache.values())
+        #txt的原始格式（类别， 坐标）5个
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
@@ -423,7 +425,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 assert l.shape[1] == 5, '> 5 label columns: %s' % file
                 assert (l >= 0).all(), 'negative labels: %s' % file
                 assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                #np.unique去除重复元素，由大到小排列
                 if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
+                    #重复元素个数加1
                     nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
                 if single_cls:
                     l[:, 0] = 0  # force dataset into single-class mode
@@ -431,7 +435,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 nf += 1  # file found
 
                 # Create subdataset (a smaller dataset)
-                if create_datasubset and ns < 1E4:
+                if create_datasubset and ns < 1E4:  # 没用
                     if ns == 0:
                         create_folder(path='./datasubset')
                         os.makedirs('./datasubset/images')
@@ -443,7 +447,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             f.write(self.img_files[i] + '\n')
 
                 # Extract object detection boxes for a second stage classifier
-                if extract_bounding_boxes:
+                if extract_bounding_boxes:#没用
                     p = Path(self.img_files[i])
                     img = cv2.imread(str(p))
                     h, w = img.shape[:2]
@@ -474,7 +478,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
-        if cache_images:
+        if cache_images:#default False
             gb = 0  # Gigabytes of cached images
             self.img_hw0, self.img_hw = [None] * n, [None] * n
             results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
@@ -484,6 +488,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 gb += self.imgs[i].nbytes
                 pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
 
+    #创建高速缓存，存储标签形状哈希值
     def cache_labels(self, path='labels.cache'):
         # Cache dataset labels, check images and read shapes
         x = {}  # dict
@@ -518,18 +523,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
     #     return self
 
     def __getitem__(self, index):
-        if self.image_weights:
+        if self.image_weights:#default False
             index = self.indices[index]
 
         hyp = self.hyp
+        #1.0之内
         mosaic = self.mosaic and random.random() < hyp['mosaic']
         if mosaic:
             # Load mosaic
             img, labels = load_mosaic(self, index)
+            
             shapes = None
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
-            if random.random() < hyp['mixup']:
+            if random.random() < hyp['mixup']:#mixup default 0
                 img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
@@ -537,6 +544,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         else:
             # Load image
+            #原始大小h0, 缩放大小h
             img, (h0, w0), (h, w) = load_image(self, index)
 
             # Letterbox
@@ -575,6 +583,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         nL = len(labels)  # number of labels
         if nL:
             labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
+            #转到马赛克之后的图片上归一化
             labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
             labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
 
@@ -589,7 +598,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nL:
-                    labels[:, 1] = 1 - labels[:, 1]
+                    labels[:, 1] = 1 - labels[:, 1]#--------------------------------------
 
         labels_out = torch.zeros((nL, 6))
         if nL:
@@ -606,10 +615,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img, label, path, shapes = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
+        #lable --- (当前批次图片索引，类别, 坐标)
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
+#返回最大边长为img_size640的图片
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
@@ -620,6 +631,7 @@ def load_image(self, index):
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
+            #缩小INTER_AREA 放大INTER_LINEAR
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
@@ -651,7 +663,11 @@ def load_mosaic(self, index):
 
     labels4 = []
     s = self.img_size
+    #mosaic_border default to  [-img_size // 2, -img_size // 2]
+    #img_size default to 640
+    #在640x640之内取均匀分布
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    #index之后随机算三个，labels是所有的
     indices = [index] + [random.randint(0, len(self.labels) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
@@ -659,8 +675,11 @@ def load_mosaic(self, index):
 
         # place img in img4
         if i == 0:  # top left
+            #背景
             img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+            #固定xc, xy
             x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
+            #在原图裁剪
             x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
         elif i == 1:  # top right
             x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
@@ -672,7 +691,10 @@ def load_mosaic(self, index):
             x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
             x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
+        #裁剪后粘贴
         img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+
+        #空余的加padding 
         padw = x1a - x1b
         padh = y1a - y1b
 
@@ -684,6 +706,7 @@ def load_mosaic(self, index):
             labels[:, 2] = h * (x[:, 2] - x[:, 4] / 2) + padh
             labels[:, 3] = w * (x[:, 1] + x[:, 3] / 2) + padw
             labels[:, 4] = h * (x[:, 2] + x[:, 4] / 2) + padh
+        #四张图片的label
         labels4.append(labels)
 
     # Concat/clip labels
@@ -694,11 +717,11 @@ def load_mosaic(self, index):
 
     # Augment
     img4, labels4 = random_perspective(img4, labels4,
-                                       degrees=self.hyp['degrees'],
-                                       translate=self.hyp['translate'],
-                                       scale=self.hyp['scale'],
-                                       shear=self.hyp['shear'],
-                                       perspective=self.hyp['perspective'],
+                                       degrees=self.hyp['degrees'],#0.0
+                                       translate=self.hyp['translate'],#0.1
+                                       scale=self.hyp['scale'],#0.5
+                                       shear=self.hyp['shear'],#0.0
+                                       perspective=self.hyp['perspective'],#0.0
                                        border=self.mosaic_border)  # border to remove
 
     return img4, labels4
@@ -729,6 +752,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 
     # Scale ratio (new / old)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    #没用
     if not scaleup:  # only scale down, do not scale up (for better test mAP)
         r = min(r, 1.0)
 
@@ -736,6 +760,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     ratio = r, r  # width, height ratios
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+    #auto default is False没用
     if auto:  # minimum rectangle
         dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding
     elif scaleFill:  # stretch
@@ -747,7 +772,10 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     dh /= 2
 
     if shape[::-1] != new_unpad:  # resize
+        #变形了，如果augment是True，就不用填充
         img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    #加个边框，默认不加
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
@@ -757,7 +785,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0, border=(0, 0)):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
-
+    
     height = img.shape[0] + border[0] * 2  # shape(h,w,c)
     width = img.shape[1] + border[1] * 2
 
@@ -837,7 +865,6 @@ def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shea
         i = box_candidates(box1=targets[:, 1:5].T * s, box2=xy.T)
         targets = targets[i]
         targets[:, 1:5] = xy[i]
-
     return img, targets
 
 
